@@ -46,9 +46,10 @@ from fpdf import FPDF
 import torch
 from transformers import pipeline, AutoModelForSeq2SeqLM, AutoModelForCausalLM, AutoTokenizer
 from langchain_community.llms import OpenAI
+from langchain_openai import ChatOpenAI
 from langchain_community.llms.huggingface_pipeline import HuggingFacePipeline
-from langchain.prompts import PromptTemplate
-from langchain.schema.runnable import RunnablePassthrough
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
 
 # Configure logging
 logging.basicConfig(
@@ -260,63 +261,79 @@ class AudioProcessor:
         self.recognizer = sr.Recognizer()
         logger.info(f"Initialized audio processor (GPU: {self.use_gpu})")
 
-    def transcribe_audio(self, audio_path: str, chunk_size: int = 60000, language: str = "en-US") -> List[Dict[str, Union[str, float, float]]]:
-        """Transcribe audio file to text.
-
-        Args:
-            audio_path: Path to the audio file
-            chunk_size: Size of audio chunks in milliseconds
-
-        Returns:
-            List of dictionaries with text, start_time, and end_time
-        """
+    def transcribe_audio(self, audio_path: str, chunk_size: int = 600000, language: str = "en-US") -> List[Dict[str, Union[str, float, float]]]:
+        """Transcribe audio file to text using Whisper API or Google fallback."""
         logger.info(f"Transcribing audio: {audio_path}")
-        try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        api_base = os.getenv("OPENAI_API_BASE")
+        if api_key and api_base:
+            return self._transcribe_whisper(audio_path, chunk_size, language, api_key, api_base)
+        return self._transcribe_google(audio_path, chunk_size, language)
+
+    def _transcribe_whisper(self, audio_path: str, chunk_size: int, language: str, api_key: str, api_base: str) -> List[Dict]:
+        """Transcribe using local Whisper via transformers pipeline."""
+        from transformers import pipeline as hf_pipeline
+        lang_code = language.split("-")[0]  # en-US -> en
+        whisper_model = os.getenv("WHISPER_MODEL", "openai/whisper-small")
+        logger.info(f"Loading local Whisper model: {whisper_model}")
+        asr = hf_pipeline(
+            "automatic-speech-recognition",
+            model=whisper_model,
+            generate_kwargs={"language": lang_code, "task": "transcribe"},
+            chunk_length_s=30,
+            stride_length_s=5,
+        )
+        logger.info(f"Running Whisper on {audio_path}")
+        result = asr(audio_path, return_timestamps=True)
+        chunks_raw = result.get("chunks", [])
+        if chunks_raw:
+            chunks = [
+                {
+                    "text": c["text"].strip(),
+                    "start_time": c["timestamp"][0] or 0.0,
+                    "end_time": c["timestamp"][1] or 0.0,
+                }
+                for c in chunks_raw
+            ]
+        else:
+            full_text = result.get("text", "")
             audio = AudioSegment.from_file(audio_path)
-            duration = len(audio)
-            chunks = []
+            chunks = [{"text": full_text, "start_time": 0.0, "end_time": len(audio) / 1000.0}]
+        logger.info(f"Whisper transcribed {len(chunks)} segments, first: {chunks[0]['text'][:80] if chunks else ''}")
+        return chunks
 
-            for start_time in range(0, duration, chunk_size):
-                end_time = min(start_time + chunk_size, duration)
-                chunk = audio[start_time:end_time]
+    def _transcribe_google(self, audio_path: str, chunk_size: int, language: str) -> List[Dict]:
+        """Fallback: Google free speech recognition."""
+        logger.info("Using Google speech recognition (fallback)")
+        audio = AudioSegment.from_file(audio_path)
+        duration = len(audio)
+        chunks = []
 
-                # Save chunk to temporary file
-                chunk_path = f"{audio_path}_chunk_{start_time}_{end_time}.wav"
-                try:
-                    chunk.export(chunk_path, format="wav")
+        for start_time in range(0, duration, min(chunk_size, 60000)):
+            end_time = min(start_time + 60000, duration)
+            chunk = audio[start_time:end_time]
+            chunk_path = f"{audio_path}_chunk_{start_time}_{end_time}.wav"
+            try:
+                chunk.export(chunk_path, format="wav")
+                with sr.AudioFile(chunk_path) as source:
+                    audio_data = self.recognizer.record(source)
+                    try:
+                        text = self.recognizer.recognize_google(audio_data, language=language)
+                    except sr.UnknownValueError:
+                        text = ""
+                    except sr.RequestError as e:
+                        logger.error(f"Google SR error: {e}")
+                        text = ""
+                chunks.append({"text": text, "start_time": start_time / 1000.0, "end_time": end_time / 1000.0})
+            finally:
+                if os.path.exists(chunk_path):
+                    try:
+                        os.remove(chunk_path)
+                    except Exception:
+                        pass
 
-                    # Transcribe chunk
-                    with sr.AudioFile(chunk_path) as source:
-                        audio_data = self.recognizer.record(source)
-                        logger.info(f"Transcribing chunk from {start_time} to {end_time} ms")
-                        try:
-                            text = self.recognizer.recognize_google(audio_data, language=language)
-                            logger.info(f"Transcribed chunk: {text}")
-                        except sr.UnknownValueError:
-                            logger.warning(f"Speech not understood for chunk {start_time}-{end_time} ms; leaving text empty.")
-                            text = ""
-                        except sr.RequestError as re_err:
-                            logger.error(f"Speech recognition service error for chunk {start_time}-{end_time} ms: {re_err}")
-                            text = ""
-
-                    chunks.append({
-                        "text": text,
-                        "start_time": start_time / 1000.0,  # Convert to seconds
-                        "end_time": end_time / 1000.0  # Convert to seconds
-                    })
-                finally:
-                    # Clean up temporary file
-                    if os.path.exists(chunk_path):
-                        try:
-                            os.remove(chunk_path)
-                        except Exception as cleanup_err:
-                            logger.warning(f"Failed to remove temp chunk file {chunk_path}: {cleanup_err}")
-
-            logger.info(f"Transcribed {len(chunks)} audio chunks")
-            return chunks
-        except Exception as e:
-            logger.error(f"Error transcribing audio: {e}")
-            raise
+        logger.info(f"Google transcribed {len(chunks)} chunks")
+        return chunks
 
 
 class LLMProcessor:
@@ -334,8 +351,15 @@ class LLMProcessor:
         self.use_gpu = use_gpu and torch.cuda.is_available()
 
         if use_openai and os.getenv("OPENAI_API_KEY"):
-            logger.info("Using OpenAI for LLM processing")
-            self.llm = OpenAI(temperature=0.1)
+            chat_model = model_name or os.getenv("VIDEO2DOCS_LLM_MODEL", "EU - Chat (GPT 5)")
+            logger.info(f"Using OpenAI-compatible API: {chat_model}")
+            self.llm = ChatOpenAI(
+                model_name=chat_model,
+                openai_api_key=os.getenv("OPENAI_API_KEY"),
+                openai_api_base=os.getenv("OPENAI_API_BASE"),
+                request_timeout=120,
+                max_retries=3,
+            )
         else:
             # Default to a HuggingFace model (allow override via .env)
             env_model = os.getenv("VIDEO2DOCS_LLM_MODEL", "").strip()
@@ -406,35 +430,46 @@ class LLMProcessor:
         """
         logger.info("Organizing content with LLM")
 
-        # Combine transcription into a single text
-        full_text = " ".join([chunk["text"] for chunk in transcription])
+        # Build timestamped transcript
+        transcript_lines = []
+        for chunk in transcription:
+            if chunk.get("text", "").strip():
+                t = int(chunk["start_time"])
+                mins, secs = divmod(t, 60)
+                transcript_lines.append(f"[{mins:02d}:{secs:02d}] {chunk['text'].strip()}")
+        timestamped_transcript = "\n".join(transcript_lines)
 
-        # Create prompt for document organization
+        # Build slide timestamp list
+        slide_list = ""
+        for i, (ts, _) in enumerate(slides, 1):
+            mins, secs = divmod(int(ts), 60)
+            slide_list += f"  Slide {i}: appears at {mins:02d}:{secs:02d}\n"
+
         prompt = PromptTemplate(
-            input_variables=["text", "num_slides"],
+            input_variables=["transcript", "slide_list"],
             template="""
             You are an AI assistant that organizes video content into a structured document.
 
-            The video contains the following transcribed text:
-            {text}
+            TIMESTAMPED TRANSCRIPT (format [MM:SS] text):
+            {transcript}
 
-            The video also contains {num_slides} slides or important images.
+            SLIDES (each slide has a timestamp showing when it appears in the video):
+            {slide_list}
 
-            Please organize this content into a well-structured document with:
-            1. A title
-            2. An executive summary
-            3. Main sections with headings
-            4. Bullet points for key information
-            5. Indications where slides should be inserted (marked as [SLIDE X])
+            Instructions:
+            - Organize the transcript into a well-structured document
+            - Insert [SLIDE X] markers at the point in the content where that slide's timestamp falls in the transcript
+            - Match slides to content by comparing slide timestamps with transcript timestamps
+            - Use [SLIDE X] where X is the slide number
 
-            Format your response as a JSON with the following structure:
+            Format your response as JSON:
             {{
                 "title": "Document Title",
                 "summary": "Executive summary text",
                 "sections": [
                     {{
                         "heading": "Section Heading",
-                        "content": "Section content with [SLIDE X] markers where appropriate",
+                        "content": "Section content with [SLIDE X] markers at the correct positions",
                         "bullet_points": ["Point 1", "Point 2"]
                     }}
                 ]
@@ -442,18 +477,22 @@ class LLMProcessor:
             """
         )
 
-        # Create formatted prompt - limit text to fit within model's token limit (512 tokens)
-        # Assuming ~4 chars per token, limit to ~1500 chars to leave room for prompt template
-        formatted_prompt = prompt.format(text=full_text[:1500], num_slides=len(slides))
+        text_limit = 400000 if self.use_openai else 1500
+        formatted_prompt = prompt.format(
+            transcript=timestamped_transcript[:text_limit],
+            slide_list=slide_list or "No slides detected.",
+        )
 
         # Invoke the LLM
         raw_result = self.llm.invoke(formatted_prompt)
 
-        # Extract text from the result (HuggingFacePipeline returns a list of dictionaries)
-        if isinstance(raw_result, list) and len(raw_result) > 0 and 'generated_text' in raw_result[0]:
-            result = raw_result[0]['generated_text']
+        # Extract text from the result
+        if hasattr(raw_result, 'content'):
+            result = raw_result.content  # AIMessage from ChatOpenAI
+        elif isinstance(raw_result, list) and len(raw_result) > 0 and 'generated_text' in raw_result[0]:
+            result = raw_result[0]['generated_text']  # HuggingFacePipeline
         else:
-            result = raw_result  # Fallback to original format for compatibility
+            result = str(raw_result)
 
         logger.debug(f"Raw LLM result type: {type(raw_result)}")
         logger.debug(f"Processed result: {result[:100]}...")
@@ -772,7 +811,8 @@ class Video2Docs:
         # Initialize components
         self.video_processor = VideoProcessor(temp_dir=self.temp_dir)
         self.audio_processor = AudioProcessor(use_gpu=self.use_gpu)
-        self.llm_processor = LLMProcessor(model_name=model_name, use_openai=False, use_gpu=self.use_gpu)
+        use_openai = bool(os.getenv("OPENAI_API_KEY") and os.getenv("USE_OPENAI", "1") != "0")
+        self.llm_processor = LLMProcessor(model_name=model_name, use_openai=use_openai, use_gpu=self.use_gpu)
         self.document_generator = DocumentGenerator(output_dir=self.output_dir)
 
     def process(self, input_path: str, output_format: str = "docx", output_name: Optional[str] = None, language: Optional[str] = None, progress_callback=None, cancel_event=None) -> str:
@@ -870,6 +910,20 @@ class Video2Docs:
             if output_name:
                 base_name = os.path.splitext(output_name)[0]
 
+            # Cache key: sha256 of first 4MB of video (fast, stable)
+            import hashlib, json as _json
+            def _video_hash(path):
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    h.update(f.read(4 * 1024 * 1024))
+                return h.hexdigest()[:16]
+
+            cache_dir = os.path.join(self.output_dir, ".cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            vid_hash = _video_hash(video_path)
+            transcription_cache = os.path.join(cache_dir, f"{vid_hash}_transcription.json")
+            slides_cache = os.path.join(cache_dir, f"{vid_hash}_slides.json")
+
             # Step 2: Extract audio
             report("extract_audio", 0.0)
             audio_path = self.video_processor.extract_audio(video_path)
@@ -877,24 +931,47 @@ class Video2Docs:
             report("extract_audio", 1.0)
             check_cancel()
 
-            # Step 3: Extract frames and detect slides
-            report("extract_frames", 0.0)
-            frames = self.video_processor.extract_frames(video_path)
-            base += weights.get("extract_frames", 0.0)
-            report("extract_frames", 1.0)
-            check_cancel()
+            # Step 3: Extract frames and detect slides (cached)
+            if os.path.exists(slides_cache):
+                logger.info(f"Loading slides from cache: {slides_cache}")
+                with open(slides_cache) as f:
+                    slides_data = _json.load(f)
+                # Restore slide image paths — only include slides whose images still exist
+                slides = [(s["timestamp"], s["path"]) for s in slides_data if os.path.exists(s["path"])]
+                if not slides:
+                    logger.info("Cached slide images missing, re-detecting")
+                    os.remove(slides_cache)
+            if not os.path.exists(slides_cache):
+                report("extract_frames", 0.0)
+                frames = self.video_processor.extract_frames(video_path)
+                base += weights.get("extract_frames", 0.0)
+                report("extract_frames", 1.0)
+                check_cancel()
+                report("detect_slides", 0.0)
+                slides = self.video_processor.detect_slides(frames)
+                base += weights.get("detect_slides", 0.0)
+                report("detect_slides", 1.0)
+                check_cancel()
+                with open(slides_cache, "w") as f:
+                    _json.dump([{"timestamp": ts, "path": p} for ts, p in slides], f)
+                logger.info(f"Slides cached: {slides_cache}")
+            else:
+                base += weights.get("extract_frames", 0.0) + weights.get("detect_slides", 0.0)
 
-            report("detect_slides", 0.0)
-            slides = self.video_processor.detect_slides(frames)
-            base += weights.get("detect_slides", 0.0)
-            report("detect_slides", 1.0)
-            check_cancel()
-
-            # Step 4: Transcribe audio
-            report("transcribe", 0.0)
-            transcription = self.audio_processor.transcribe_audio(audio_path, language=language) if language else self.audio_processor.transcribe_audio(audio_path)
-            base += weights.get("transcribe", 0.0)
-            report("transcribe", 1.0)
+            # Step 4: Transcribe audio (cached)
+            if os.path.exists(transcription_cache):
+                logger.info(f"Loading transcription from cache: {transcription_cache}")
+                with open(transcription_cache) as f:
+                    transcription = _json.load(f)
+                base += weights.get("transcribe", 0.0)
+            else:
+                report("transcribe", 0.0)
+                transcription = self.audio_processor.transcribe_audio(audio_path, language=language) if language else self.audio_processor.transcribe_audio(audio_path)
+                base += weights.get("transcribe", 0.0)
+                report("transcribe", 1.0)
+                with open(transcription_cache, "w") as f:
+                    _json.dump(transcription, f)
+                logger.info(f"Transcription cached: {transcription_cache}")
             check_cancel()
 
             # Step 5: Organize content with LLM
