@@ -34,7 +34,7 @@ Edit `.env` — the required fields are:
 OPENAI_API_KEY=<your Azure OpenAI key>
 AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com/
 AZURE_OPENAI_API_VERSION=2024-02-01
-VIDEO2DOCS_LLM_MODEL=gpt-4.1
+VIDEO2DOCS_LLM_MODEL=gpt-5.4
 
 # Azure Whisper (transcription)
 AZURE_WHISPER_ENDPOINT=https://<your-resource>.cognitiveservices.azure.com

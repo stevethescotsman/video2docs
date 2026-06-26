@@ -1,9 +1,9 @@
 {
-  "default": "gpt-4.1",
+  "default": "gpt-5.4",
   "models": [
-    {"id": "gpt-4.1", "label": "GPT-4.1 (Recommended)"},
-    {"id": "gpt-4.1-mini", "label": "GPT-4.1 Mini (Fastest)"},
-    {"id": "gpt-5.1", "label": "GPT-5.1 (Best quality)"},
-    {"id": "gpt-5.4", "label": "GPT-5.4 (Best quality+)"}
+    {"id": "gpt-5.4", "label": "GPT-5.4 (Recommended)"},
+    {"id": "gpt-5.1", "label": "GPT-5.1"},
+    {"id": "gpt-4.1", "label": "GPT-4.1"},
+    {"id": "gpt-4.1-mini", "label": "GPT-4.1 Mini (Fastest)"}
   ]
 }
