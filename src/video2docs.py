@@ -46,7 +46,7 @@ from fpdf import FPDF
 import torch
 from transformers import pipeline, AutoModelForSeq2SeqLM, AutoModelForCausalLM, AutoTokenizer
 from langchain_community.llms import OpenAI
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_community.llms.huggingface_pipeline import HuggingFacePipeline
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
@@ -213,12 +213,13 @@ class VideoProcessor:
             logger.error(f"Error extracting frames: {e}")
             raise
 
-    def detect_slides(self, frames: List[Tuple[float, str]], threshold: float = 0.8) -> List[Tuple[float, str]]:
+    def detect_slides(self, frames: List[Tuple[float, str]], threshold: float = 0.92, min_gap_s: float = 10.0) -> List[Tuple[float, str]]:
         """Detect slides/images in the extracted frames.
 
         Args:
             frames: List of (timestamp, frame_path) tuples
-            threshold: Similarity threshold for slide detection
+            threshold: Similarity threshold — higher = fewer, more significant changes only
+            min_gap_s: Minimum seconds between slides to ignore transient cursor/highlight changes
 
         Returns:
             List of (timestamp, frame_path) tuples for detected slides
@@ -227,25 +228,46 @@ class VideoProcessor:
         if not frames:
             return []
 
-        slides = [frames[0]]  # First frame is always a slide
+        slides = [frames[0]]
 
         for i in range(1, len(frames)):
+            curr_ts = frames[i][0]
+            if curr_ts - slides[-1][0] < min_gap_s:
+                continue  # Too soon after last slide
+
             prev_img = cv2.imread(slides[-1][1], cv2.IMREAD_GRAYSCALE)
             curr_img = cv2.imread(frames[i][1], cv2.IMREAD_GRAYSCALE)
 
-            # Resize images to same dimensions if needed
+            if prev_img is None or curr_img is None:
+                continue
+
             if prev_img.shape != curr_img.shape:
                 curr_img = cv2.resize(curr_img, (prev_img.shape[1], prev_img.shape[0]))
 
-            # Calculate similarity
             similarity = ssim(prev_img, curr_img)
 
             if similarity < threshold:
                 slides.append(frames[i])
-                logger.debug(f"Detected new slide at {frames[i][0]:.2f}s (similarity: {similarity:.2f})")
+                logger.debug(f"Detected new slide at {curr_ts:.2f}s (similarity: {similarity:.2f})")
 
         logger.info(f"Detected {len(slides)} slides")
         return slides
+
+    def extract_frame_at_time(self, video_path: str, timestamp: float, filename: str):
+        """Extract a single frame at the given timestamp (seconds) from a video."""
+        try:
+            video = cv2.VideoCapture(video_path)
+            fps = video.get(cv2.CAP_PROP_FPS) or 25.0
+            video.set(cv2.CAP_PROP_POS_FRAMES, int(timestamp * fps))
+            success, frame = video.read()
+            video.release()
+            if success:
+                cv2.imwrite(filename, frame)
+                return filename
+            return None
+        except Exception as e:
+            logger.error(f"Error extracting frame at {timestamp}s: {e}")
+            return None
 
 
 class AudioProcessor:
@@ -262,19 +284,89 @@ class AudioProcessor:
         logger.info(f"Initialized audio processor (GPU: {self.use_gpu})")
 
     def transcribe_audio(self, audio_path: str, chunk_size: int = 600000, language: str = "en-US") -> List[Dict[str, Union[str, float, float]]]:
-        """Transcribe audio file to text using Whisper API or Google fallback."""
+        """Transcribe audio file to text using Azure Whisper, local Whisper, or Google fallback."""
         logger.info(f"Transcribing audio: {audio_path}")
-        api_key = os.getenv("OPENAI_API_KEY")
-        api_base = os.getenv("OPENAI_API_BASE")
-        if api_key and api_base:
-            return self._transcribe_whisper(audio_path, chunk_size, language, api_key, api_base)
+        use_whisper = (
+            (os.getenv("AZURE_WHISPER_ENDPOINT") and os.getenv("AZURE_WHISPER_KEY"))
+            or (os.getenv("OPENAI_API_KEY") and os.getenv("OPENAI_API_BASE"))
+        )
+        if use_whisper:
+            return self._transcribe_whisper(audio_path, chunk_size, language, None, None)
+        logger.warning("No Whisper config found — falling back to Google SR (poor quality)")
         return self._transcribe_google(audio_path, chunk_size, language)
 
     def _transcribe_whisper(self, audio_path: str, chunk_size: int, language: str, api_key: str, api_base: str) -> List[Dict]:
+        """Transcribe using Azure Whisper API if configured, otherwise local model."""
+        azure_whisper_endpoint = os.getenv("AZURE_WHISPER_ENDPOINT")
+        azure_whisper_key = os.getenv("AZURE_WHISPER_KEY")
+        if azure_whisper_endpoint and azure_whisper_key:
+            return self._transcribe_azure_whisper(audio_path, chunk_size, language, azure_whisper_endpoint, azure_whisper_key)
+        return self._transcribe_local_whisper(audio_path, language)
+
+    def _transcribe_azure_whisper(self, audio_path: str, chunk_size: int, language: str, endpoint: str, api_key: str) -> List[Dict]:
+        """Transcribe using Azure-hosted Whisper REST API — 25MB chunks, no local GPU needed."""
+        import openai as _openai
+        lang_code = language.split("-")[0]
+        client = _openai.AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=endpoint,
+            api_version="2024-06-01",
+        )
+        audio = AudioSegment.from_file(audio_path)
+        duration = len(audio)
+        chunks = []
+
+        for start_ms in range(0, duration, chunk_size):
+            end_ms = min(start_ms + chunk_size, duration)
+            chunk = audio[start_ms:end_ms]
+            chunk_path = f"{audio_path}_chunk_{start_ms}.mp3"
+            try:
+                chunk.export(chunk_path, format="mp3", bitrate="64k")
+                file_size = os.path.getsize(chunk_path)
+                if file_size > 24 * 1024 * 1024:
+                    logger.warning(f"Chunk {start_ms}-{end_ms}ms too large ({file_size//1024}KB), skipping")
+                    chunks.append({"text": "", "start_time": start_ms / 1000.0, "end_time": end_ms / 1000.0})
+                    continue
+                logger.info(f"Azure Whisper transcribing {start_ms//1000}s-{end_ms//1000}s ({file_size//1024}KB)")
+                with open(chunk_path, "rb") as f:
+                    result = client.audio.transcriptions.create(
+                        model="whisper",
+                        file=f,
+                        language=lang_code,
+                        response_format="verbose_json",
+                        timestamp_granularities=["segment"],
+                    )
+                chunk_offset = start_ms / 1000.0
+                if hasattr(result, 'segments') and result.segments:
+                    for seg in result.segments:
+                        chunks.append({
+                            "text": seg.text.strip(),
+                            "start_time": chunk_offset + seg.start,
+                            "end_time": chunk_offset + seg.end,
+                        })
+                    logger.info(f"Azure Whisper chunk: {len(result.segments)} segments, first: {result.segments[0].text[:60]}")
+                else:
+                    # Fallback: single chunk with coarse timestamp
+                    chunks.append({"text": result.text.strip(), "start_time": chunk_offset, "end_time": end_ms / 1000.0})
+                    logger.info(f"Azure Whisper chunk (no segments): {result.text[:80]}")
+            except Exception as e:
+                logger.error(f"Azure Whisper error {start_ms}-{end_ms}ms: {e}")
+                chunks.append({"text": "", "start_time": start_ms / 1000.0, "end_time": end_ms / 1000.0})
+            finally:
+                if os.path.exists(chunk_path):
+                    try:
+                        os.remove(chunk_path)
+                    except Exception:
+                        pass
+
+        logger.info(f"Azure Whisper transcribed {len(chunks)} chunks")
+        return chunks
+
+    def _transcribe_local_whisper(self, audio_path: str, language: str) -> List[Dict]:
         """Transcribe using local Whisper via transformers pipeline."""
         from transformers import pipeline as hf_pipeline
-        lang_code = language.split("-")[0]  # en-US -> en
-        whisper_model = os.getenv("WHISPER_MODEL", "openai/whisper-small")
+        lang_code = language.split("-")[0]
+        whisper_model = os.getenv("WHISPER_MODEL", "openai/whisper-large-v3")
         logger.info(f"Loading local Whisper model: {whisper_model}")
         asr = hf_pipeline(
             "automatic-speech-recognition",
@@ -283,23 +375,19 @@ class AudioProcessor:
             chunk_length_s=30,
             stride_length_s=5,
         )
-        logger.info(f"Running Whisper on {audio_path}")
+        logger.info(f"Running local Whisper on {audio_path}")
         result = asr(audio_path, return_timestamps=True)
         chunks_raw = result.get("chunks", [])
         if chunks_raw:
             chunks = [
-                {
-                    "text": c["text"].strip(),
-                    "start_time": c["timestamp"][0] or 0.0,
-                    "end_time": c["timestamp"][1] or 0.0,
-                }
+                {"text": c["text"].strip(), "start_time": c["timestamp"][0] or 0.0, "end_time": c["timestamp"][1] or 0.0}
                 for c in chunks_raw
             ]
         else:
             full_text = result.get("text", "")
             audio = AudioSegment.from_file(audio_path)
             chunks = [{"text": full_text, "start_time": 0.0, "end_time": len(audio) / 1000.0}]
-        logger.info(f"Whisper transcribed {len(chunks)} segments, first: {chunks[0]['text'][:80] if chunks else ''}")
+        logger.info(f"Local Whisper transcribed {len(chunks)} segments")
         return chunks
 
     def _transcribe_google(self, audio_path: str, chunk_size: int, language: str) -> List[Dict]:
@@ -351,15 +439,28 @@ class LLMProcessor:
         self.use_gpu = use_gpu and torch.cuda.is_available()
 
         if use_openai and os.getenv("OPENAI_API_KEY"):
-            chat_model = model_name or os.getenv("VIDEO2DOCS_LLM_MODEL", "EU - Chat (GPT 5)")
-            logger.info(f"Using OpenAI-compatible API: {chat_model}")
-            self.llm = ChatOpenAI(
-                model_name=chat_model,
-                openai_api_key=os.getenv("OPENAI_API_KEY"),
-                openai_api_base=os.getenv("OPENAI_API_BASE"),
-                request_timeout=120,
-                max_retries=3,
-            )
+            chat_model = model_name or os.getenv("VIDEO2DOCS_LLM_MODEL", "gpt-4.1")
+            azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+            logger.info(f"Using {'Azure' if azure_endpoint else 'OpenAI-compatible'} API: {chat_model}")
+            if azure_endpoint:
+                self.llm = AzureChatOpenAI(
+                    azure_deployment=chat_model,
+                    azure_endpoint=azure_endpoint,
+                    api_key=os.getenv("OPENAI_API_KEY"),
+                    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+                    request_timeout=120,
+                    max_retries=3,
+                    streaming=True,
+                )
+            else:
+                self.llm = ChatOpenAI(
+                    model_name=chat_model,
+                    openai_api_key=os.getenv("OPENAI_API_KEY"),
+                    openai_api_base=os.getenv("OPENAI_API_BASE"),
+                    request_timeout=120,
+                    max_retries=3,
+                    streaming=True,
+                )
         else:
             # Default to a HuggingFace model (allow override via .env)
             env_model = os.getenv("VIDEO2DOCS_LLM_MODEL", "").strip()
@@ -439,90 +540,95 @@ class LLMProcessor:
                 transcript_lines.append(f"[{mins:02d}:{secs:02d}] {chunk['text'].strip()}")
         timestamped_transcript = "\n".join(transcript_lines)
 
-        # Build slide timestamp list
-        slide_list = ""
-        for i, (ts, _) in enumerate(slides, 1):
-            mins, secs = divmod(int(ts), 60)
-            slide_list += f"  Slide {i}: appears at {mins:02d}:{secs:02d}\n"
-
         prompt = PromptTemplate(
-            input_variables=["transcript", "slide_list"],
+            input_variables=["transcript"],
             template="""
             You are an AI assistant that organizes video content into a structured document.
 
             TIMESTAMPED TRANSCRIPT (format [MM:SS] text):
             {transcript}
 
-            SLIDES (each slide has a timestamp showing when it appears in the video):
-            {slide_list}
-
             Instructions:
-            - Organize the transcript into a well-structured document
-            - Insert [SLIDE X] markers at the point in the content where that slide's timestamp falls in the transcript
-            - Match slides to content by comparing slide timestamps with transcript timestamps
-            - Use [SLIDE X] where X is the slide number
+            - Divide the transcript into logical sections based on topic changes
+            - For each section record the start_time and end_time in total seconds (integers) from the [MM:SS] timestamps
+            - bullet_points are the PRIMARY content — detailed and informative, 4-6 points per section
+            - content is a single brief intro sentence for the section
+            - Preserve chronological order — sections must follow the video timeline
 
-            Format your response as JSON:
+            Respond ONLY with JSON, no markdown fences:
             {{
                 "title": "Document Title",
-                "summary": "Executive summary text",
+                "summary": "Executive summary 2-3 sentences",
                 "sections": [
                     {{
                         "heading": "Section Heading",
-                        "content": "Section content with [SLIDE X] markers at the correct positions",
-                        "bullet_points": ["Point 1", "Point 2"]
+                        "start_time": 0,
+                        "end_time": 120,
+                        "content": "One sentence intro.",
+                        "bullet_points": ["Detailed point 1", "Detailed point 2"]
                     }}
                 ]
             }}
             """
         )
 
-        text_limit = 400000 if self.use_openai else 1500
-        formatted_prompt = prompt.format(
-            transcript=timestamped_transcript[:text_limit],
-            slide_list=slide_list or "No slides detected.",
-        )
+        text_limit = 20000 if self.use_openai else 1500
+        formatted_prompt = prompt.format(transcript=timestamped_transcript[:text_limit])
 
         # Invoke the LLM
         raw_result = self.llm.invoke(formatted_prompt)
 
-        # Extract text from the result
         if hasattr(raw_result, 'content'):
-            result = raw_result.content  # AIMessage from ChatOpenAI
+            result = raw_result.content
         elif isinstance(raw_result, list) and len(raw_result) > 0 and 'generated_text' in raw_result[0]:
-            result = raw_result[0]['generated_text']  # HuggingFacePipeline
+            result = raw_result[0]['generated_text']
         else:
             result = str(raw_result)
 
-        logger.debug(f"Raw LLM result type: {type(raw_result)}")
         logger.debug(f"Processed result: {result[:100]}...")
 
         # Parse the result
         try:
-            # Extract JSON from the response (it might be surrounded by markdown code blocks)
-            json_match = re.search(r'```json\n(.*?)\n```', result, re.DOTALL)
-            if json_match:
-                result = json_match.group(1)
-
             import json
+            # Strip markdown fences if present
+            json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', result, re.DOTALL)
+            result = json_match.group(1) if json_match else result.strip()
             document_structure = json.loads(result)
-            logger.info("Successfully organized content")
+
+            # Inject slides by timestamp — deterministic, no LLM guessing
+            slide_times = [(ts, path) for ts, path in slides]
+            used = set()
+            for section in document_structure.get("sections", []):
+                sec_start = float(section.get("start_time", 0))
+                sec_end = float(section.get("end_time", 999999))
+                section_slides = []
+                for i, (ts, path) in enumerate(slide_times):
+                    if i not in used and sec_start <= ts < sec_end:
+                        section_slides.append(i + 1)  # 1-based for document generator
+                        used.add(i)
+                section["slide_indices"] = section_slides
+
+            # Any slides outside all section ranges → assign to nearest section
+            for i, (ts, _) in enumerate(slide_times):
+                if i not in used and document_structure.get("sections"):
+                    nearest = min(
+                        range(len(document_structure["sections"])),
+                        key=lambda j: abs(float(document_structure["sections"][j].get("start_time", 0)) - ts)
+                    )
+                    document_structure["sections"][nearest].setdefault("slide_indices", []).append(i + 1)
+                    used.add(i)
+
+            logger.info("Successfully organised content with timestamp-matched slides")
             return document_structure
         except Exception as e:
             logger.error(f"Error parsing LLM response: {e}")
             logger.debug(f"Raw LLM response: {result}")
-
-            # Return a basic structure if parsing fails
+            full_text = " ".join([c["text"] for c in transcription])
             return {
                 "title": "Transcribed Video",
                 "summary": full_text[:500] + "...",
-                "sections": [
-                    {
-                        "heading": "Full Transcription",
-                        "content": full_text,
-                        "bullet_points": []
-                    }
-                ]
+                "sections": [{"heading": "Full Transcription", "start_time": 0, "end_time": 999999,
+                               "content": full_text, "bullet_points": [], "slide_indices": list(range(1, len(slides)+1))}]
             }
 
 
@@ -560,43 +666,26 @@ class DocumentGenerator:
         doc.add_heading("Executive Summary", level=1)
         doc.add_paragraph(content["summary"])
 
-        # Add a section for slides/images if available
-        if slides:
-            doc.add_heading("Slides/Images", level=1)
-            for i, (timestamp, slide_path) in enumerate(slides):
-                try:
-                    # Add a caption for the slide
-                    doc.add_paragraph(f"Slide {i+1} (Timestamp: {timestamp:.2f}s)")
-                    # Add the image
-                    doc.add_picture(slide_path, width=Inches(6))
-                    # Add some space after each image
-                    doc.add_paragraph()
-                except Exception as e:
-                    logger.error(f"Error adding slide {i} from {slide_path}: {e}")
-
-        # Add sections
+        # Add sections — text leads, screenshots follow at end of section
         for section in content["sections"]:
             doc.add_heading(section["heading"], level=1)
 
-            # Process content with slide markers
-            content_parts = re.split(r'(\[SLIDE \d+\])', section["content"])
-            for part in content_parts:
-                slide_match = re.match(r'\[SLIDE (\d+)\]', part)
-                if slide_match:
-                    slide_index = int(slide_match.group(1))
-                    if 0 <= slide_index < len(slides):
-                        try:
-                            doc.add_picture(slides[slide_index][1], width=Inches(6))
-                        except Exception as e:
-                            logger.error(f"Error adding slide {slide_index} from {slides[slide_index][1]}: {e}")
-                else:
-                    if part.strip():
-                        doc.add_paragraph(part)
+            if section.get("content", "").strip():
+                doc.add_paragraph(section["content"])
 
-            # Add bullet points
             if section.get("bullet_points"):
                 for point in section["bullet_points"]:
                     doc.add_paragraph(point, style='List Bullet')
+
+            # Screenshots after the text content they illustrate
+            for slide_num in section.get("slide_indices", []):
+                slide_index = slide_num - 1
+                if 0 <= slide_index < len(slides):
+                    try:
+                        doc.add_picture(slides[slide_index][1], width=Inches(6))
+                        doc.add_paragraph()
+                    except Exception as e:
+                        logger.error(f"Error adding slide {slide_index}: {e}")
 
         # Save document
         doc.save(output_path)
@@ -834,9 +923,8 @@ class Video2Docs:
         weights = {
             "download": 0.10,
             "extract_audio": 0.05,
-            "extract_frames": 0.25,
             "detect_slides": 0.10,
-            "transcribe": 0.30,
+            "transcribe": 0.55,
             "organize_content": 0.05,
             "generate_document": 0.15,
         }
@@ -931,34 +1019,7 @@ class Video2Docs:
             report("extract_audio", 1.0)
             check_cancel()
 
-            # Step 3: Extract frames and detect slides (cached)
-            if os.path.exists(slides_cache):
-                logger.info(f"Loading slides from cache: {slides_cache}")
-                with open(slides_cache) as f:
-                    slides_data = _json.load(f)
-                # Restore slide image paths — only include slides whose images still exist
-                slides = [(s["timestamp"], s["path"]) for s in slides_data if os.path.exists(s["path"])]
-                if not slides:
-                    logger.info("Cached slide images missing, re-detecting")
-                    os.remove(slides_cache)
-            if not os.path.exists(slides_cache):
-                report("extract_frames", 0.0)
-                frames = self.video_processor.extract_frames(video_path)
-                base += weights.get("extract_frames", 0.0)
-                report("extract_frames", 1.0)
-                check_cancel()
-                report("detect_slides", 0.0)
-                slides = self.video_processor.detect_slides(frames)
-                base += weights.get("detect_slides", 0.0)
-                report("detect_slides", 1.0)
-                check_cancel()
-                with open(slides_cache, "w") as f:
-                    _json.dump([{"timestamp": ts, "path": p} for ts, p in slides], f)
-                logger.info(f"Slides cached: {slides_cache}")
-            else:
-                base += weights.get("extract_frames", 0.0) + weights.get("detect_slides", 0.0)
-
-            # Step 4: Transcribe audio (cached)
+            # Step 3: Transcribe audio (cached)
             if os.path.exists(transcription_cache):
                 logger.info(f"Loading transcription from cache: {transcription_cache}")
                 with open(transcription_cache) as f:
@@ -974,12 +1035,53 @@ class Video2Docs:
                 logger.info(f"Transcription cached: {transcription_cache}")
             check_cancel()
 
-            # Step 5: Organize content with LLM
+            # Step 4: Organize content with LLM (no slides yet — sections drive screenshot timing)
             report("organize_content", 0.0)
-            content = self.llm_processor.organize_content(transcription, slides)
+            content = self.llm_processor.organize_content(transcription, [])
             base += weights.get("organize_content", 0.0)
             report("organize_content", 1.0)
             check_cancel()
+
+            # Step 5: Extract one screenshot per section at the section midpoint (cached)
+            if os.path.exists(slides_cache):
+                logger.info(f"Loading slides from cache: {slides_cache}")
+                with open(slides_cache) as f:
+                    slides_data = _json.load(f)
+                slides = [(s["timestamp"], s["path"]) for s in slides_data if os.path.exists(s["path"])]
+                if not slides:
+                    logger.info("Cached slide images missing, re-extracting")
+                    os.remove(slides_cache)
+            if not os.path.exists(slides_cache):
+                report("detect_slides", 0.0)
+                slides = []
+                # Get actual video duration to clamp timestamps
+                _vid_cap = cv2.VideoCapture(video_path)
+                _vid_fps = _vid_cap.get(cv2.CAP_PROP_FPS) or 25.0
+                _vid_frames = _vid_cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                _vid_cap.release()
+                video_duration = (_vid_frames / _vid_fps) - 1.0 if _vid_frames > 0 else 999999.0
+                for i, section in enumerate(content.get("sections", [])):
+                    sec_start = float(section.get("start_time", 0))
+                    sec_end = float(section.get("end_time", sec_start + 60))
+                    midpoint = min((sec_start + sec_end) / 2.0, video_duration)
+                    frame_path = os.path.join(self.video_processor.temp_dir, f"section_{i:03d}.jpg")
+                    result_frame = self.video_processor.extract_frame_at_time(video_path, midpoint, frame_path)
+                    if result_frame:
+                        slides.append((midpoint, result_frame))
+                    else:
+                        logger.warning(f"Could not extract frame for section {i} at {midpoint:.1f}s")
+                base += weights.get("detect_slides", 0.0)
+                report("detect_slides", 1.0)
+                check_cancel()
+                with open(slides_cache, "w") as f:
+                    _json.dump([{"timestamp": ts, "path": p} for ts, p in slides], f)
+                logger.info(f"Section screenshots cached: {slides_cache} ({len(slides)} frames)")
+            else:
+                base += weights.get("detect_slides", 0.0)
+
+            # Assign each section its corresponding screenshot (1-based index)
+            for i, section in enumerate(content.get("sections", [])):
+                section["slide_indices"] = [i + 1] if i < len(slides) else []
 
             # Step 6: Generate document
             output_path = os.path.join(self.output_dir, f"{base_name}.{output_format}")

@@ -1,272 +1,98 @@
 # Video2Docs
 
-A Python application that converts YouTube videos or local video files to document formats (ODT, DOCX, PDF). The application extracts text from speech, identifies slides/images, and uses LLMs to organize the content into a well-structured document.
-![img.png](img.png)
+Converts video recordings to structured Word documents. Upload a local video (or YouTube URL), and the app transcribes the audio with Azure Whisper, uses GPT-4.1 to organise the content into sections with bullet points, and captures one screenshot per section — aligned to the transcript.
 
-## Features
-
-- Convert YouTube videos to documents by providing a URL
-- Convert local video files to documents
-- Automatically extract text from speech using speech recognition
-- Multi-language speech recognition (set via --language or VIDEO2DOCS_LANGUAGE; supports BCP-47 codes like en-US, ru-RU)
-- Detect and extract slides/images from the video
-- Use LLMs to organize content into a structured document
-- Generate documents in multiple formats (ODT, DOCX, PDF)
-- GPU acceleration for faster processing (when available)
+Output: a `.docx` with titled sections, bullet point summaries, and a relevant screenshot per section.
 
 ## Requirements
 
 - Python 3.10+ (3.11 recommended)
-- FFmpeg installed and on PATH (required by MoviePy and pydub)
-- CUDA-compatible GPU (optional, for faster processing)
+- FFmpeg on PATH — install via `brew install ffmpeg` (Mac) or [ffmpeg.org](https://ffmpeg.org/download.html) (Windows)
+- Azure OpenAI resource with a GPT-4.1 deployment
+- Azure OpenAI resource with a Whisper deployment (for transcription)
 
-## Installation
+## Setup
 
-1. Clone this repository:
-   ```shell
-   git clone https://github.com/yourusername/video2docs.git
-   cd video2docs
-   ```
-
-2. Create a virtual environment (recommended):
-   ```shell
-   python -m venv venv
-   ```
-
-3. Activate the virtual environment:
-   - Windows:
-     ```PowerShell
-     venv\Scripts\activate
-     ```
-   - macOS/Linux:
-     ```shell
-     source venv/bin/activate
-     ```
-
-4. Install the required dependencies:
-   ```shell
-   pip install -r requirements.txt
-   ```
-
-5. (Optional) For GPU acceleration, make sure you have the appropriate CUDA drivers installed for your GPU.
-   ```shell
-   pip3 install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu130
-   ```
-
-6. (Optional) For OpenAI integration, create a `.env` file in the project root and add your API key:
-   ```
-   OPENAI_API_KEY=your_api_key_here
-   HUGGINGFACEHUB_API_TOKEN=your_huggingface_token_here
-   ```
-
-## Usage
-
-### Basic Usage
-
-Convert a YouTube video to a DOCX document:
-
-```
-python src/video2docs.py "https://www.youtube.com/watch?v=VIDEO_ID"
+```shell
+git clone https://github.com/stevethescotsman/video2docs.git
+cd video2docs
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-Convert a local video file to a PDF document:
+Copy the example env file and fill in your credentials:
 
-```
-python src/video2docs.py path/to/your/video.mp4 --format pdf
-```
-
-### Command-line Options
-
-- `input`: YouTube URL or path to local video file (required)
-- `--format`, `-f`: Output document format (choices: "docx", "odt", "pdf", default: "docx")
-- `--output-dir`, `-o`: Directory to save output documents (default: "output")
-- `--temp-dir`, `-t`: Directory for temporary files (default: auto-generated)
-- `--language`, `-l`: Language code for speech recognition (BCP-47, e.g., `en-US`, `ru-RU`). Defaults to `VIDEO2DOCS_LANGUAGE` env var or `en-US`.
-- `--no-gpu`: Disable GPU usage
-- `--verbose`, `-v`: Enable verbose logging
-
-### Examples
-
-Convert a YouTube video to a DOCX document with verbose logging:
-
-```
-python src/video2docs.py "https://www.youtube.com/watch?v=VIDEO_ID" -v
+```shell
+cp .env.example .env
 ```
 
-Convert a local video file to an ODT document and save it in a specific directory:
+Edit `.env` — the required fields are:
 
+```env
+# Azure OpenAI (GPT-4.1 for summarisation)
+OPENAI_API_KEY=<your Azure OpenAI key>
+AZURE_OPENAI_ENDPOINT=https://<your-resource>.openai.azure.com/
+AZURE_OPENAI_API_VERSION=2024-02-01
+VIDEO2DOCS_LLM_MODEL=gpt-4.1
+
+# Azure Whisper (transcription)
+AZURE_WHISPER_ENDPOINT=https://<your-resource>.cognitiveservices.azure.com
+AZURE_WHISPER_KEY=<your Whisper key>
+
+# Web UI login
+ADMIN_USER=admin
+ADMIN_PASS=<choose a password>
+SECRET_KEY=<random string>
+PORT=5001
 ```
-python src/video2docs.py path/to/your/video.mp4 --format odt --output-dir my_documents
+
+> **Note:** `.env` is gitignored — your keys are never committed.
+
+## Run
+
+```shell
+python -m src.webapp
 ```
 
-### Multi-language transcription
+Open [http://localhost:5001](http://localhost:5001) and log in with the credentials from your `.env`.
 
-By default, English (`en-US`) is used for speech recognition. To transcribe in other languages, specify a BCP-47 language code:
+On Windows: double-click `run_web.bat`. On Mac/Linux: `./run_web.sh`.
 
-- CLI example (Russian):
-  ```
-  python src/video2docs.py path/to/your/video.mp4 -l ru-RU
-  ```
-- Web UI: set `VIDEO2DOCS_LANGUAGE` in your `.env` before starting the app, for example:
-  ```env
-  VIDEO2DOCS_LANGUAGE=ru-RU
-  ```
+## How to convert a video
 
-Supported codes are those supported by the Google Web Speech API (e.g., en-US, en-GB, ru-RU, es-ES, de-DE, fr-FR, etc.).
+1. Log in
+2. Click **New Conversion**
+3. Upload a video file (mp4, mov, avi, mkv, webm) or paste a YouTube URL
+4. Choose output format (DOCX recommended) and click **Convert**
+5. The conversion runs in the background — the page shows live progress
+6. When done, click **Download** to get the document
 
-## How It Works
+A 14-minute screen recording takes roughly 2–3 minutes (transcription dominates). Repeat conversions of the same video use a local cache and complete in ~20 seconds.
 
-1. **Video Processing**:
-   - For YouTube videos: Downloads the video using pytubefix
-   - For local files: Uses the provided file path
-   - Extracts frames from the video at regular intervals
+## How it works
 
-2. **Audio Processing**:
-   - Extracts audio from the video
-   - Transcribes the audio to text using speech recognition
+1. **Transcription** — Azure Whisper transcribes the audio with per-segment timestamps
+2. **Section detection** — GPT-4.1 reads the timestamped transcript and divides it into logical sections, each with a heading, summary sentence, and bullet points
+3. **Screenshots** — one frame is extracted from the video at the midpoint of each section's time range, so screenshots match the content they sit next to
+4. **Document generation** — sections are written out with text first, screenshot below
 
-3. **Slide Detection**:
-   - Analyzes extracted frames to detect slides/images
-   - Uses structural similarity to identify unique slides
+## Supported models
 
-4. **Content Organization**:
-   - Uses LLMs (either Hugging Face models or OpenAI) to organize the transcribed text
-   - Creates a structured document with sections, bullet points, and slide placements
-
-5. **Document Generation**:
-   - Generates the document in the specified format (DOCX, ODT, or PDF)
-   - Includes detected slides/images in the appropriate locations
-
-## API Usage and Costs
-
-When using OpenAI's ChatGPT API for content organization, it's important to understand how video length affects API usage and costs:
-
-- **Token Usage**: The application sends the first 1500 characters of the transcribed text to the LLM. This typically amounts to approximately 300-500 tokens, depending on the complexity of the language.
-
-- **Cost Estimation by Video Length**:
-  - **Short videos (1-5 minutes)**: Approximately 500-1500 tokens, costing around $0.01-$0.03 with GPT-3.5 or $0.05-$0.15 with GPT-4.
-  - **Medium videos (5-15 minutes)**: The transcription may exceed 1500 characters, but the application still only sends the first 1500 characters, keeping costs similar to short videos.
-  - **Long videos (15+ minutes)**: Despite the length, API costs remain constant since only the first 1500 characters are processed. However, this may result in incomplete content organization for very long videos.
-
-- **Optimizing Costs**:
-  - For longer videos, consider breaking them into smaller segments for better content organization.
-  - Use the Hugging Face models option instead of OpenAI for cost-free processing (though quality may vary).
-  - Adjust the character limit in the source code if you need more comprehensive processing of longer videos (this will increase API costs).
-
-Note: These estimates are based on OpenAI's pricing as of 2023. Check [OpenAI's pricing page](https://openai.com/pricing) for the most current rates.
-
-## Customization
-
-You can customize the behavior of the application by modifying the parameters in the `src/video2docs.py` file:
-
-- Change the default LLM model via environment variable VIDEO2DOCS_LLM_MODEL in your .env file (or by modifying the `model_name` parameter in the `LLMProcessor` class)
-- Adjust the frame extraction interval by modifying the `interval` parameter in the `extract_frames` method
-- Modify the slide detection threshold by changing the `threshold` parameter in the `detect_slides` method
-
-## Running tests
-
-To run the test suite locally using pytest:
-
-1. (Recommended) Create and activate a virtual environment.
-2. Install test dependencies:
-   ```shell
-   pip install -r requirements-ci.txt
-   ```
-3. Run the tests:
-   ```shell
-   pytest -q
-   ```
-   For more detailed output, use:
-   ```shell
-   pytest -v
-   ```
-
-Continuous Integration:
-- This repository includes a GitHub Actions workflow at `.github/workflows/ci.yml` that runs `pytest` automatically on pushes and pull requests.
+Edit `config/llm_models.json` to change the available models in the UI dropdown. The default is `gpt-4.1`. Any model deployed to your Azure OpenAI resource can be used.
 
 ## Troubleshooting
 
-- **GPU not being used**: Make sure you have the appropriate CUDA drivers installed and that PyTorch can detect your GPU. You can check this by running `torch.cuda.is_available()` in a Python shell.
-- **Memory errors**: Processing large videos can be memory-intensive. Try reducing the frame extraction interval or processing shorter video segments.
-- **Missing dependencies**: Make sure all dependencies are installed by running `pip install -r requirements.txt`.
+| Problem | Fix |
+|---------|-----|
+| Port 5001 already in use | Change `PORT=` in `.env` |
+| `ffmpeg not found` | Install ffmpeg and ensure it's on PATH |
+| Transcription fails | Check `AZURE_WHISPER_ENDPOINT` and `AZURE_WHISPER_KEY` in `.env` |
+| LLM times out | Check `AZURE_OPENAI_ENDPOINT` and `OPENAI_API_KEY` in `.env` |
+| Screenshots missing | LLM may have returned timestamps past the video end — known edge case, usually affects the last section only |
 
-## Web UI (Beta)
-
-A simple Bootstrap-powered web UI is included.
-
-1. Set up your environment in a `.env` file (optional, defaults shown):
-   ```env
-   ADMIN_USER=admin
-   ADMIN_PASS=admin123
-   SECRET_KEY=change-me
-   OUTPUT_DIR=output
-   # TEMP_DIR=output/temp
-   # Default speech recognition language (BCP-47), e.g., en-US, ru-RU
-   VIDEO2DOCS_LANGUAGE=en-US
-
-   # Web server settings
-   HOST=127.0.0.1
-   PORT=5000
-   FLASK_DEBUG=0
-
-   # Optional API keys
-   # HUGGINGFACEHUB_API_TOKEN=
-   # OPENAI_API_KEY=
-   ```
-2. Install requirements:
-   ```shell
-   pip install -r requirements.txt
-   ```
-3. Run the web app:
-   ```shell
-   python -m src.webapp
-   ```
-   Alternatively, on Windows you can run run_web.bat; on macOS/Linux, run run_web.sh
-4. Open http://localhost:5000 and log in with the configured credentials.
-
-Features:
-- Login (credentials from .env)
-- New conversion: YouTube URL or file upload, choose format, optional output filename
-- History list with details page per conversion
-- Ability to re-run a previous conversion with modified parameters
-- Download the generated document from the detail page
-
-Notes:
-- Conversions and their metadata are stored in `OUTPUT_DIR/conversions.json`.
-- Uploaded files are saved under `OUTPUT_DIR/uploads`.
-- Processing runs in the background with live progress and ETA. You can cancel a running conversion from the dedicated Running page. Closing the browser/tab will not interrupt the process.
+Logs: `/tmp/webapp.log`
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-
-## Run as a service
-
-- Linux (systemd):
-  - Ensure dependencies are installed and, optionally, create a virtual environment in ./venv
-  - Install and start the service (requires sudo):
-    ```bash
-    sudo ./install_service_linux.sh [--user USER] [--name SERVICE_NAME]
-    # default service name: video2docs
-    # view logs:
-    sudo journalctl -u video2docs -f
-    ```
-
-- Windows (Service via NSSM):
-  - Install NSSM (https://nssm.cc/download) and ensure nssm.exe is in PATH
-  - Install and start the service from a terminal opened in the repository root:
-    ```bat
-    install_service_windows.bat [ServiceName]
-    rem default name: Video2Docs
-    ```
-  - Manage with NSSM commands:
-    ```bat
-    nssm status Video2Docs
-    nssm stop Video2Docs
-    nssm remove Video2Docs confirm
-    ```
-
-Notes
-- The application loads environment variables from .env in the repository root if present.
-- By default, the service runs the Flask web UI: `python -m src.webapp`.
+MIT — see LICENSE file.

@@ -1,11 +1,9 @@
 {
-  "default": "EU - Chat (GPT 5 Mini)",
+  "default": "gpt-4.1",
   "models": [
-    {"id": "EU - Chat (GPT 5)", "label": "GPT-5 (Best quality)"},
-    {"id": "EU - Chat (GPT 5 Mini)", "label": "GPT-5 Mini (Fast)"},
-    {"id": "EU - Chat (GPT 5 Nano)", "label": "GPT-5 Nano (Fastest)"},
-    {"id": "EU - Chat (GPT 4o)", "label": "GPT-4o (Reliable)"},
-    {"id": "EU - mistral-large", "label": "Mistral Large"},
-    {"id": "EU - bedrock-nova-pro", "label": "AWS Nova Pro"}
+    {"id": "gpt-4.1", "label": "GPT-4.1 (Recommended)"},
+    {"id": "gpt-4.1-mini", "label": "GPT-4.1 Mini (Fastest)"},
+    {"id": "gpt-5.1", "label": "GPT-5.1 (Best quality)"},
+    {"id": "gpt-5.4", "label": "GPT-5.4 (Best quality+)"}
   ]
 }
